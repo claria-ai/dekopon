@@ -25,7 +25,32 @@ after disconnect require live validation.
 Claria owns persistence, document/proposal validation, citations, authorization,
 prompt construction, token budgets, cache placement, user edits and usage pricing.
 The package introduces no history database, gateway, broker daemon, shell or
-telemetry exporter. The host owns retries so nested loops cannot multiply them.
+telemetry exporter. One `agent::drive` owns model-call and inference-invocation bounds,
+retry waits and cancellation. The host selects retry eligibility and delays;
+there is no retry loop inside the backend.
+
+## Receipt and effect boundaries
+
+`Session` adapts a domain response without translating it into a second transcript.
+The driver calls `generate`, awaits `record` to completion, then calls `apply`.
+It never drops a receipt write or admitted effect future when Stop arrives. A
+completed response wins simultaneous cancellation so the host can record its usage.
+By default Stop after a receipt prevents effects; a host can explicitly defer it
+through an already accepted batch or its finalization cut. The native Bedrock
+`run` adapter uses the same driver and checks cancellation between tools.
+
+`model_failed` and `stopped(in_flight)` let the host retain unknown usage across
+recovered retries visible to the driver. A missing provider receipt is not a
+metered zero. No model retry includes effects from an incomplete response, and the driver never retries
+host persistence or tools. Actual idempotency and conditional writes remain host
+contracts.
+
+The AWS SDK retains the host's retry configuration. Its internal attempts are
+not additional driver invocations. A per-request signing-hook counter reports
+`sdk_attempts`; when it exceeds one, the host must preserve final-response usage
+but mark earlier usage unknown. Claria does this in both the immutable call
+receipt and attempt totals. The counter observes SDK attempts, not provider
+billing or every possible transport-level retry.
 
 ## Scoped fork contract
 
@@ -52,14 +77,18 @@ does not bound SDK frame allocation or ignored future event payloads. Unknown
 event handling still needs a wire fixture. Rust 1.97 is declared for Claria
 compatibility; checks currently use the installed Rust 1.98.1.
 
-The initial checkpoint integrates only the backend into Claria's existing Writer
-calls. The small tool-loop kernel is tested separately pending review before
-migrating Claria's sequential and parallel executors. It does not yet expose
-intermediate call receipts or restore a transcript after a committed multi-step
-interruption. Those are requirements for production migration, still owned by
-Claria's existing loop. Its synthetic resume test starts fresh with edited context.
+Claria's sequential Writer and each planned section branch now implement `Session`.
+They retain their distinct domain validation and retry policies while sharing this
+driver. Claria saves immutable intermediate call receipts and resumes from its
+existing durable document/run state, not a package-owned transcript database.
+Orderly Stop/failure recovery is fixture-tested. Process-death takeover of a run
+still marked active requires an explicit ownership design and is not provided here.
 
 The inherited native dependency-audit policy does not pass for this package:
 Claria's exact Tokio 1.52.3 pin has RUSTSEC-2026-0386, and AWS's SDK graph contains
 both generations of `http` and `http-body`. No audit exceptions were added. A
-coordinated dependency decision is required before this checkpoint can ship.
+coordinated dependency decision is required before this checkpoint can ship. An
+isolated probe of checkpoint `94acc810f6e96cb6f48ec10065fdab5f0c8a788d` passes the
+unchanged policy and all 23 checkpoint tests with Tokio 1.53.3, AWS config 1.12.0,
+Bedrock Runtime 1.146.0 and Smithy types 1.8.0. The integrated pins are unchanged;
+Claria's other exact AWS pins must move coherently before adopting that option.

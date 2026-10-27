@@ -5,10 +5,10 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    convert::Infallible,
     num::{NonZeroU32, NonZeroUsize},
     ops::ControlFlow,
     sync::Mutex,
+    time::Duration,
 };
 
 use aws_smithy_types::Document;
@@ -17,8 +17,8 @@ use dekopon_embedded::{
     bedrock::{BedrockError, BedrockRequest, BedrockResponse, StreamLimits},
     sdk::types::{
         ContentBlock, ConversationRole, InferenceConfiguration, Message, ReasoningContentBlock,
-        ReasoningTextBlock, StopReason, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
-        ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
+        ReasoningTextBlock, StopReason, TokenUsage, Tool, ToolConfiguration, ToolInputSchema,
+        ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
     },
 };
 use tokio::sync::watch;
@@ -67,10 +67,34 @@ struct DocumentHost {
     revisions: Vec<String>,
     reads: usize,
     cancel_after_commit: Option<watch::Sender<bool>>,
+    cancel_during_record: Option<watch::Sender<bool>>,
+    receipts: Vec<Option<TokenUsage>>,
+    unknown_usage: bool,
+    reject_receipt: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("synthetic receipt store unavailable")]
+struct ReceiptFailure;
+
 impl ToolHost for DocumentHost {
-    type Error = Infallible;
+    type Error = ReceiptFailure;
+
+    async fn record(&mut self, response: &BedrockResponse) -> Result<(), Self::Error> {
+        if self.reject_receipt {
+            return Err(ReceiptFailure);
+        }
+        if let Some(cancel) = &self.cancel_during_record {
+            cancel.send(true).expect("stop during receipt");
+            tokio::task::yield_now().await;
+        }
+        self.receipts.push(response.usage.clone());
+        Ok(())
+    }
+
+    fn model_failed(&mut self) {
+        self.unknown_usage = true;
+    }
 
     async fn execute(&mut self, call: &ToolUseBlock) -> Result<ToolResultBlock, Self::Error> {
         let (text, status) = match call.name() {
@@ -144,6 +168,7 @@ fn response(content: Vec<ContentBlock>, stop_reason: StopReason) -> BedrockRespo
         stop_reason,
         usage: None,
         latency_ms: 7,
+        sdk_attempts: 1,
     }
 }
 
@@ -237,6 +262,8 @@ async fn evidence_failure_repair_and_revision_preserve_native_replay_and_exact_o
     assert_eq!(host.revisions, [expected]);
     assert_eq!((outcome.model_calls, outcome.tool_calls), (4, 3));
     assert!(outcome.response.usage.is_none());
+    assert_eq!(host.receipts.len(), 4);
+    assert!(host.receipts.iter().all(Option::is_none));
     assert_eq!(visible, "Draft revised from the supplied evidence.");
     let requests = model.requests.lock().expect("requests");
     assert_eq!(requests[1][1].content()[0], reasoning);
@@ -343,6 +370,7 @@ async fn silent_inference_can_stop_and_resume_with_the_users_latest_edit() {
         },
     );
     assert!(matches!(result, Err(AgentError::Cancelled)));
+    assert!(host.unknown_usage);
     assert!(host.revisions.is_empty());
     assert_eq!(original_messages, [user("Original synthetic section")]);
     let resumed = ScriptedModel::new(vec![
@@ -537,4 +565,313 @@ async fn a_tool_id_reused_in_a_later_round_cannot_repeat_a_host_effect() {
         AgentError::Protocol(ProtocolFailure::DuplicateToolId)
     ));
     assert_eq!(host.revisions, ["first revision"]);
+}
+
+#[tokio::test]
+async fn receipt_failure_prevents_all_tool_effects() {
+    let model = ScriptedModel::new(vec![response(
+        vec![call("write", "write_section", "must not commit")],
+        StopReason::ToolUse,
+    )]);
+    let mut host = DocumentHost {
+        reject_receipt: true,
+        ..DocumentHost::default()
+    };
+    let error = agent::run(
+        &model,
+        &mut host,
+        request("revise"),
+        limits(),
+        watch::channel(false).1,
+        &mut |_| ControlFlow::Continue(()),
+    )
+    .await
+    .err()
+    .expect("receipt failure");
+    assert!(matches!(error, AgentError::Host(ReceiptFailure)));
+    assert!(host.revisions.is_empty());
+    assert!(host.receipts.is_empty());
+}
+
+#[tokio::test]
+async fn stopping_during_a_receipt_saves_usage_before_refusing_tool_admission() {
+    let (stop, cancel) = watch::channel(false);
+    let mut generated = response(
+        vec![call("write", "write_section", "must not commit")],
+        StopReason::ToolUse,
+    );
+    generated.usage = Some(
+        TokenUsage::builder()
+            .input_tokens(12)
+            .output_tokens(8)
+            .total_tokens(20)
+            .build()
+            .expect("usage"),
+    );
+    let model = ScriptedModel::new(vec![generated]);
+    let mut host = DocumentHost {
+        cancel_during_record: Some(stop),
+        ..DocumentHost::default()
+    };
+    let error = agent::run(
+        &model,
+        &mut host,
+        request("revise"),
+        limits(),
+        cancel,
+        &mut |_| ControlFlow::Continue(()),
+    )
+    .await
+    .err()
+    .expect("stopped");
+    assert!(matches!(error, AgentError::Cancelled));
+    assert!(host.revisions.is_empty());
+    assert_eq!(
+        host.receipts[0]
+            .as_ref()
+            .expect("saved usage")
+            .total_tokens(),
+        20
+    );
+    assert!(!host.unknown_usage);
+}
+
+#[derive(Debug, PartialEq)]
+enum LifecycleError {
+    Stopped(bool),
+    Failed(u32),
+    Limit,
+}
+
+#[derive(Default)]
+struct Lifecycle {
+    responses: VecDeque<Result<u32, ()>>,
+    calls: Vec<u32>,
+    attempts: usize,
+    receipts: Vec<u32>,
+    applied: Vec<u32>,
+    unknown_usage: bool,
+    retry_delay: Option<Duration>,
+    retry_notice: Option<watch::Sender<bool>>,
+    finish_value: Option<u32>,
+    cancel_in_apply: Option<watch::Sender<bool>>,
+    cancel_on_response: Option<watch::Sender<bool>>,
+    finish_after_apply: bool,
+    defer_after_apply: bool,
+}
+
+impl agent::Session for Lifecycle {
+    type Response = u32;
+    type ModelError = ();
+    type Error = LifecycleError;
+    type Outcome = ();
+
+    fn start_call(&mut self, index: u32) -> Result<(), Self::Error> {
+        self.calls.push(index);
+        Ok(())
+    }
+    async fn generate(&mut self) -> Result<u32, ()> {
+        self.attempts += 1;
+        if let Some(cancel) = &self.cancel_on_response {
+            cancel.send(true).expect("response stop race");
+        }
+        self.responses.pop_front().expect("scripted response")
+    }
+    async fn record(&mut self, response: &u32) -> Result<(), Self::Error> {
+        self.receipts.push(*response);
+        Ok(())
+    }
+    async fn apply(&mut self, response: u32) -> Result<ControlFlow<()>, Self::Error> {
+        if let Some(cancel) = &self.cancel_in_apply {
+            cancel.send(true).expect("cancel admitted batch");
+            tokio::task::yield_now().await;
+        }
+        self.applied.push(response);
+        if self.finish_after_apply || self.finish_value == Some(response) {
+            Ok(ControlFlow::Break(()))
+        } else {
+            Ok(ControlFlow::Continue(()))
+        }
+    }
+    fn retry_delay(&self, _: &(), _: u32, _: Duration) -> Option<Duration> {
+        if let Some(notice) = &self.retry_notice {
+            notice.send(true).expect("retry notice");
+        }
+        self.retry_delay
+    }
+    fn model_failed(&mut self, _: &()) {
+        self.unknown_usage = true;
+    }
+    fn failed(&mut self, _: (), attempt: u32, _: Duration) -> Self::Error {
+        LifecycleError::Failed(attempt)
+    }
+    fn stopped(&mut self, in_flight: bool) -> Self::Error {
+        self.unknown_usage |= in_flight;
+        LifecycleError::Stopped(in_flight)
+    }
+    fn call_limit(&mut self) -> Self::Error {
+        LifecycleError::Limit
+    }
+    fn cancellation_deferred(&self) -> bool {
+        self.defer_after_apply && !self.applied.is_empty()
+    }
+}
+
+fn drive_limits() -> agent::DriveLimits {
+    agent::DriveLimits {
+        model_calls: NonZeroU32::new(3).expect("calls"),
+        attempts_per_call: NonZeroU32::new(2).expect("attempts"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_recovered_model_attempt_keeps_unknown_usage_and_never_repeats_effects() {
+    let mut session = Lifecycle {
+        responses: [Err(()), Ok(41)].into(),
+        retry_delay: Some(Duration::from_secs(1)),
+        finish_after_apply: true,
+        ..Lifecycle::default()
+    };
+    agent::drive(&mut session, &watch::channel(false).1, drive_limits())
+        .await
+        .expect("retried");
+    assert_eq!(session.calls, [1]);
+    assert_eq!(session.attempts, 2);
+    assert_eq!(session.receipts, [41]);
+    assert_eq!(session.applied, [41]);
+    assert!(session.unknown_usage);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_driver_enforces_attempt_and_call_limits_above_host_retry_policy() {
+    let mut retrying = Lifecycle {
+        responses: [Err(()), Err(())].into(),
+        retry_delay: Some(Duration::from_secs(1)),
+        ..Lifecycle::default()
+    };
+    assert_eq!(
+        agent::drive(&mut retrying, &watch::channel(false).1, drive_limits()).await,
+        Err(LifecycleError::Failed(2))
+    );
+    assert!(retrying.unknown_usage);
+    assert!(retrying.receipts.is_empty());
+    let mut continuing = Lifecycle {
+        responses: [Ok(1), Ok(2), Ok(3)].into(),
+        ..Lifecycle::default()
+    };
+    assert_eq!(
+        agent::drive(&mut continuing, &watch::channel(false).1, drive_limits()).await,
+        Err(LifecycleError::Limit)
+    );
+    assert_eq!(continuing.calls, [1, 2, 3]);
+    assert_eq!(continuing.receipts, continuing.applied);
+}
+
+#[tokio::test]
+async fn cancellation_before_a_call_creates_no_receipt_or_unknown_usage() {
+    let mut session = Lifecycle::default();
+    assert_eq!(
+        agent::drive(&mut session, &watch::channel(true).1, drive_limits()).await,
+        Err(LifecycleError::Stopped(false))
+    );
+    assert!(session.calls.is_empty());
+    assert!(session.receipts.is_empty());
+    assert!(!session.unknown_usage);
+}
+
+#[tokio::test]
+async fn an_admitted_batch_completes_after_stop_and_keeps_its_receipt() {
+    let (stop, cancel) = watch::channel(false);
+    let mut session = Lifecycle {
+        responses: [Ok(7)].into(),
+        cancel_in_apply: Some(stop),
+        ..Lifecycle::default()
+    };
+    assert_eq!(
+        agent::drive(&mut session, &cancel, drive_limits()).await,
+        Err(LifecycleError::Stopped(false))
+    );
+    assert_eq!(session.receipts, [7]);
+    assert_eq!(session.applied, [7]);
+    assert!(!session.unknown_usage);
+}
+
+#[tokio::test]
+async fn a_host_finish_cut_defers_stop_through_the_closing_model_call() {
+    let (stop, cancel) = watch::channel(false);
+    let mut session = Lifecycle {
+        responses: [Ok(7), Ok(8)].into(),
+        cancel_in_apply: Some(stop),
+        defer_after_apply: true,
+        finish_value: Some(8),
+        ..Lifecycle::default()
+    };
+    assert_eq!(
+        agent::drive(&mut session, &cancel, drive_limits()).await,
+        Ok(())
+    );
+    assert_eq!(session.receipts, [7, 8]);
+    assert_eq!(session.applied, [7, 8]);
+    assert!(!session.unknown_usage);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stopping_during_retry_backoff_does_not_issue_another_model_attempt() {
+    let (notice, mut retrying) = watch::channel(false);
+    let (stop, cancel) = watch::channel(false);
+    let mut session = Lifecycle {
+        responses: [Err(())].into(),
+        retry_delay: Some(Duration::from_secs(60)),
+        retry_notice: Some(notice),
+        ..Lifecycle::default()
+    };
+    let (result, ()) = tokio::join!(agent::drive(&mut session, &cancel, drive_limits()), async {
+        retrying
+            .wait_for(|value| *value)
+            .await
+            .expect("retry scheduled");
+        stop.send(true).expect("stop retry");
+    },);
+    assert_eq!(result, Err(LifecycleError::Stopped(false)));
+    assert_eq!(session.attempts, 1);
+    assert!(session.unknown_usage);
+    assert!(session.receipts.is_empty());
+    assert!(session.applied.is_empty());
+}
+
+#[tokio::test]
+async fn a_completed_response_racing_stop_is_receipted_before_tool_admission() {
+    let (stop, cancel) = watch::channel(false);
+    let mut session = Lifecycle {
+        responses: [Ok(13)].into(),
+        cancel_on_response: Some(stop),
+        ..Lifecycle::default()
+    };
+    assert_eq!(
+        agent::drive(&mut session, &cancel, drive_limits()).await,
+        Err(LifecycleError::Stopped(false))
+    );
+    assert_eq!(session.receipts, [13]);
+    assert!(session.applied.is_empty());
+    assert!(!session.unknown_usage);
+}
+
+#[tokio::test]
+async fn stop_during_the_last_allowed_batch_is_not_reported_as_budget_exhaustion() {
+    let (stop, cancel) = watch::channel(false);
+    let mut session = Lifecycle {
+        responses: [Ok(1)].into(),
+        cancel_in_apply: Some(stop),
+        ..Lifecycle::default()
+    };
+    let bounds = agent::DriveLimits {
+        model_calls: NonZeroU32::MIN,
+        ..drive_limits()
+    };
+    assert_eq!(
+        agent::drive(&mut session, &cancel, bounds).await,
+        Err(LifecycleError::Stopped(false))
+    );
+    assert_eq!(session.applied, [1]);
+    assert_eq!(session.receipts, [1]);
 }

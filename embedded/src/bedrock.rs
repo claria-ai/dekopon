@@ -1,6 +1,10 @@
 use std::{
     collections::{BTreeMap, HashSet},
     ops::ControlFlow,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -80,6 +84,9 @@ pub struct BedrockResponse {
     pub stop_reason: StopReason,
     pub usage: Option<TokenUsage>,
     pub latency_ms: u64,
+    /// SDK signing-stage attempts, not a provider billing count. More than one
+    /// means the final response's usage cannot account for earlier attempts.
+    pub sdk_attempts: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +192,8 @@ impl BedrockClient {
             return Err(BedrockError::InvalidRequest);
         }
         let started = Instant::now();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let observed_attempts = Arc::clone(&attempts);
         let send = self
             .client
             .converse_stream()
@@ -194,6 +203,10 @@ impl BedrockClient {
             .set_tool_config(request.tools)
             .inference_config(request.inference)
             .set_additional_model_request_fields(request.additional_fields)
+            .customize()
+            .mutate_request(move |_| {
+                observed_attempts.fetch_add(1, Ordering::Relaxed);
+            })
             .send();
         let mut response = tokio::time::timeout(request.limits.first_frame, send)
             .await
@@ -223,6 +236,12 @@ impl BedrockClient {
         }
         let mut result = collector.finish()?;
         result.latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        result.sdk_attempts = attempts.load(Ordering::Relaxed);
+        tracing::info!(
+            sdk_attempts = result.sdk_attempts,
+            latency_ms = result.latency_ms,
+            "embedded model exchange completed"
+        );
         Ok(result)
     }
 }
@@ -580,6 +599,7 @@ impl StreamCollector {
             stop_reason,
             usage: self.usage,
             latency_ms: 0,
+            sdk_attempts: 1,
         })
     }
 }

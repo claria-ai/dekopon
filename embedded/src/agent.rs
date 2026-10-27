@@ -2,6 +2,7 @@ use std::{
     future::Future,
     num::{NonZeroU32, NonZeroUsize},
     ops::ControlFlow,
+    time::Duration,
 };
 
 use aws_smithy_types::Document;
@@ -36,10 +37,159 @@ impl InferenceModel for BedrockClient {
 pub trait ToolHost: Send {
     type Error: std::error::Error + Send + Sync + 'static;
 
+    fn record<'a>(
+        &'a mut self,
+        response: &'a BedrockResponse,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'a;
+
+    fn model_failed(&mut self);
+
     fn execute<'a>(
         &'a mut self,
         call: &'a ToolUseBlock,
     ) -> impl Future<Output = Result<ToolResultBlock, Self::Error>> + Send + 'a;
+}
+
+pub trait Cancellation: Sync {
+    fn is_stopped(&self) -> bool;
+    fn stopped(&self) -> impl Future<Output = ()> + Send;
+}
+
+impl Cancellation for watch::Receiver<bool> {
+    fn is_stopped(&self) -> bool {
+        *self.borrow()
+    }
+
+    async fn stopped(&self) {
+        let mut receiver = self.clone();
+        loop {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+pub trait Session: Send {
+    type Response: Send + Sync;
+    type ModelError: Send;
+    type Error: Send;
+    type Outcome: Send;
+
+    fn start_call(&mut self, index: u32) -> Result<(), Self::Error>;
+    fn generate(&mut self)
+    -> impl Future<Output = Result<Self::Response, Self::ModelError>> + Send;
+    /// Persist completed-call accounting before the driver admits effects.
+    /// This future is never dropped by driver cancellation.
+    fn record(
+        &mut self,
+        response: &Self::Response,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    /// Apply one accepted response. The host owns validation and commit boundaries.
+    fn apply(
+        &mut self,
+        response: Self::Response,
+    ) -> impl Future<Output = Result<ControlFlow<Self::Outcome>, Self::Error>> + Send;
+    fn retry_delay(
+        &self,
+        error: &Self::ModelError,
+        attempt: u32,
+        elapsed: Duration,
+    ) -> Option<Duration>;
+    /// Preserve uncertainty from every physical failure, including recovered retries.
+    fn model_failed(&mut self, error: &Self::ModelError);
+    fn failed(&mut self, error: Self::ModelError, attempt: u32, elapsed: Duration) -> Self::Error;
+    fn stopped(&mut self, in_flight: bool) -> Self::Error;
+    fn call_limit(&mut self) -> Self::Error;
+    /// A host may finish an already admitted batch or a durable finalization cut.
+    fn cancellation_deferred(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct DriveLimits {
+    pub model_calls: NonZeroU32,
+    pub attempts_per_call: NonZeroU32,
+}
+
+pub async fn drive<S: Session, C: Cancellation>(
+    session: &mut S,
+    cancel: &C,
+    limits: DriveLimits,
+) -> Result<S::Outcome, S::Error> {
+    for index in 1..=limits.model_calls.get() {
+        if !session.cancellation_deferred() && cancel.is_stopped() {
+            return Err(session.stopped(false));
+        }
+        session.start_call(index)?;
+        let started = tokio::time::Instant::now();
+        let mut attempt = 1;
+        let response = loop {
+            if !session.cancellation_deferred() && cancel.is_stopped() {
+                return Err(session.stopped(false));
+            }
+            tracing::debug!(
+                call = index,
+                attempt,
+                phase = "inference",
+                "embedded session"
+            );
+            let generated = if session.cancellation_deferred() {
+                session.generate().await
+            } else {
+                tokio::select! {
+                    biased;
+                    response = session.generate() => response,
+                    () = cancel.stopped() => return Err(session.stopped(true)),
+                }
+            };
+            match generated {
+                Ok(response) => break response,
+                Err(error) => {
+                    session.model_failed(&error);
+                    let elapsed = started.elapsed();
+                    let delay = if attempt < limits.attempts_per_call.get() {
+                        session.retry_delay(&error, attempt, elapsed)
+                    } else {
+                        None
+                    };
+                    let Some(delay) = delay else {
+                        return Err(session.failed(error, attempt, elapsed));
+                    };
+                    if session.cancellation_deferred() {
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        tokio::select! {
+                            biased;
+                            () = cancel.stopped() => return Err(session.stopped(false)),
+                            () = tokio::time::sleep(delay) => {},
+                        }
+                    }
+                    attempt += 1;
+                }
+            }
+        };
+        // Completed usage must land even if Stop arrives while the receipt is being saved.
+        tracing::debug!(call = index, attempt, phase = "receipt", "embedded session");
+        session.record(&response).await?;
+        if !session.cancellation_deferred() && cancel.is_stopped() {
+            return Err(session.stopped(false));
+        }
+        // The host owns admitted effects and their commit boundary; never drop that future.
+        tracing::debug!(call = index, attempt, phase = "effects", "embedded session");
+        match session.apply(response).await? {
+            ControlFlow::Break(outcome) => return Ok(outcome),
+            ControlFlow::Continue(()) => {}
+        }
+    }
+    if !session.cancellation_deferred() && cancel.is_stopped() {
+        return Err(session.stopped(false));
+    }
+    Err(session.call_limit())
 }
 
 #[derive(Clone, Copy)]
@@ -97,25 +247,92 @@ pub struct Outcome {
 pub async fn run<M: InferenceModel, H: ToolHost>(
     model: &M,
     host: &mut H,
-    mut request: BedrockRequest<'_>,
+    request: BedrockRequest<'_>,
     limits: Limits,
-    mut cancel: watch::Receiver<bool>,
+    cancel: watch::Receiver<bool>,
     observe: &mut (dyn FnMut(&str) -> ControlFlow<()> + Send),
 ) -> Result<Outcome, AgentError<H::Error>> {
-    let mut model_calls = 0;
-    let mut tool_calls = 0_u32;
-    loop {
-        check_cancelled(&cancel)?;
-        check_transcript(&request.messages, limits)?;
-        if model_calls == limits.model_calls.get() {
-            return Err(AgentError::Limit(Resource::ModelCalls));
+    let mut session = NativeSession {
+        model,
+        host,
+        request,
+        limits,
+        cancel: &cancel,
+        observe,
+        model_calls: 0,
+        tool_calls: 0,
+    };
+    drive(
+        &mut session,
+        &cancel,
+        DriveLimits {
+            model_calls: limits.model_calls,
+            attempts_per_call: NonZeroU32::MIN,
+        },
+    )
+    .await
+}
+
+struct NativeSession<'a, 'model, M, H> {
+    model: &'a M,
+    host: &'a mut H,
+    request: BedrockRequest<'model>,
+    limits: Limits,
+    cancel: &'a watch::Receiver<bool>,
+    observe: &'a mut (dyn FnMut(&str) -> ControlFlow<()> + Send),
+    model_calls: u32,
+    tool_calls: u32,
+}
+
+impl<M: InferenceModel, H: ToolHost> Session for NativeSession<'_, '_, M, H> {
+    type Response = BedrockResponse;
+    type ModelError = BedrockError;
+    type Error = AgentError<H::Error>;
+    type Outcome = Outcome;
+
+    fn start_call(&mut self, index: u32) -> Result<(), Self::Error> {
+        check_transcript(&self.request.messages, self.limits)?;
+        self.model_calls = index;
+        Ok(())
+    }
+
+    async fn generate(&mut self) -> Result<Self::Response, Self::ModelError> {
+        self.model
+            .generate(self.request.clone(), self.observe)
+            .await
+    }
+
+    async fn record(&mut self, response: &Self::Response) -> Result<(), Self::Error> {
+        self.host.record(response).await.map_err(AgentError::Host)
+    }
+
+    fn retry_delay(&self, _: &Self::ModelError, _: u32, _: Duration) -> Option<Duration> {
+        None
+    }
+
+    fn model_failed(&mut self, _: &Self::ModelError) {
+        self.host.model_failed();
+    }
+
+    fn failed(&mut self, error: Self::ModelError, _: u32, _: Duration) -> Self::Error {
+        AgentError::Model(error)
+    }
+
+    fn stopped(&mut self, in_flight: bool) -> Self::Error {
+        if in_flight {
+            self.host.model_failed();
         }
-        let response = tokio::select! {
-            biased;
-            () = cancelled(&mut cancel) => return Err(AgentError::Cancelled),
-            response = model.generate(request.clone(), observe) => response.map_err(AgentError::Model)?,
-        };
-        model_calls += 1;
+        AgentError::Cancelled
+    }
+
+    fn call_limit(&mut self) -> Self::Error {
+        AgentError::Limit(Resource::ModelCalls)
+    }
+
+    async fn apply(
+        &mut self,
+        response: Self::Response,
+    ) -> Result<ControlFlow<Self::Outcome>, Self::Error> {
         if response.message.role() != &ConversationRole::Assistant {
             return Err(AgentError::Protocol(ProtocolFailure::AssistantRole));
         }
@@ -130,22 +347,24 @@ pub async fn run<M: InferenceModel, H: ToolHost>(
             .collect();
         let call_count = u32::try_from(calls.len()).unwrap_or(u32::MAX);
         tracing::info!(
-            model_calls,
+            model_calls = self.model_calls,
             tool_calls = call_count,
             latency_ms = response.latency_ms,
             "embedded model turn completed"
         );
         match (&response.stop_reason, calls.is_empty()) {
             (StopReason::EndTurn | StopReason::StopSequence, true) => {
-                request.messages.push(response.message.clone());
-                check_transcript(&request.messages, limits)?;
-                check_cancelled(&cancel)?;
-                return Ok(Outcome {
-                    transcript: request.messages,
+                self.request.messages.push(response.message.clone());
+                check_transcript(&self.request.messages, self.limits)?;
+                if self.cancel.is_stopped() {
+                    return Err(AgentError::Cancelled);
+                }
+                return Ok(ControlFlow::Break(Outcome {
+                    transcript: std::mem::take(&mut self.request.messages),
                     response,
-                    model_calls,
-                    tool_calls,
-                });
+                    model_calls: self.model_calls,
+                    tool_calls: self.tool_calls,
+                }));
             }
             (StopReason::ToolUse, false) | (StopReason::MaxTokens, false) => {}
             (StopReason::ToolUse, true)
@@ -154,14 +373,15 @@ pub async fn run<M: InferenceModel, H: ToolHost>(
             }
             _ => return Err(AgentError::Stopped(response.stop_reason)),
         }
-        if call_count > limits.tool_calls.get().saturating_sub(tool_calls) {
+        if call_count > self.limits.tool_calls.get().saturating_sub(self.tool_calls) {
             return Err(AgentError::Limit(Resource::ToolCalls));
         }
         for (index, call) in calls.iter().enumerate() {
             if calls[..index]
                 .iter()
                 .any(|prior| prior.tool_use_id() == call.tool_use_id())
-                || request
+                || self
+                    .request
                     .messages
                     .iter()
                     .flat_map(|message| message.content())
@@ -172,7 +392,7 @@ pub async fn run<M: InferenceModel, H: ToolHost>(
             {
                 return Err(AgentError::Protocol(ProtocolFailure::DuplicateToolId));
             }
-            let offered = request.tools.as_ref().is_some_and(|config| {
+            let offered = self.request.tools.as_ref().is_some_and(|config| {
                 config.tools().iter().any(|tool| match tool {
                     Tool::ToolSpec(spec) => spec.name() == call.name(),
                     _ => false,
@@ -182,49 +402,31 @@ pub async fn run<M: InferenceModel, H: ToolHost>(
                 return Err(AgentError::Protocol(ProtocolFailure::ToolNotOffered));
             }
         }
-        if request.messages.len().saturating_add(2) > limits.messages.get() {
+        if self.request.messages.len().saturating_add(2) > self.limits.messages.get() {
             return Err(AgentError::Limit(Resource::Messages));
         }
-        request.messages.push(response.message.clone());
-        check_transcript(&request.messages, limits)?;
+        self.request.messages.push(response.message.clone());
+        check_transcript(&self.request.messages, self.limits)?;
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
-            check_cancelled(&cancel)?;
+            if self.cancel.is_stopped() {
+                return Err(AgentError::Cancelled);
+            }
             // An admitted host effect owns its commit; cancellation only prevents the next effect.
-            let result = host.execute(call).await.map_err(AgentError::Host)?;
+            let result = self.host.execute(call).await.map_err(AgentError::Host)?;
             if result.tool_use_id() != call.tool_use_id() {
                 return Err(AgentError::Protocol(ProtocolFailure::ToolResultId));
             }
             results.push(ContentBlock::ToolResult(result));
-            tool_calls += 1;
+            self.tool_calls += 1;
         }
         let results = Message::builder()
             .role(ConversationRole::User)
             .set_content(Some(results))
             .build()
             .map_err(AgentError::Message)?;
-        request.messages.push(results);
-    }
-}
-
-fn check_cancelled<E: std::error::Error>(
-    cancel: &watch::Receiver<bool>,
-) -> Result<(), AgentError<E>> {
-    if *cancel.borrow() {
-        Err(AgentError::Cancelled)
-    } else {
-        Ok(())
-    }
-}
-
-async fn cancelled(cancel: &mut watch::Receiver<bool>) {
-    loop {
-        if *cancel.borrow_and_update() {
-            return;
-        }
-        if cancel.changed().await.is_err() {
-            std::future::pending::<()>().await;
-        }
+        self.request.messages.push(results);
+        Ok(ControlFlow::Continue(()))
     }
 }
 
