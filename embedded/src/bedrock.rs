@@ -208,18 +208,31 @@ impl BedrockClient {
                 observed_attempts.fetch_add(1, Ordering::Relaxed);
             })
             .send();
-        let mut response = tokio::time::timeout(request.limits.first_frame, send)
-            .await
-            .map_err(|_| BedrockError::Interrupted {
-                phase: FailurePhase::AwaitingResponse,
-                kind: InterruptionKind::Timeout,
-            })?
-            .map_err(|error| {
+        let first_frame = async {
+            let mut response = send.await.map_err(|error| {
                 service_error(FailurePhase::AwaitingResponse, error, |response| {
                     Some(response.status().as_u16())
                 })
             })?;
+            let event = response
+                .stream
+                .recv()
+                .await
+                .map_err(|error| stream_service_error(FailurePhase::Streaming, error))?;
+            Ok::<_, BedrockError>((response, event))
+        };
+        let (mut response, first_event) =
+            tokio::time::timeout(request.limits.first_frame, first_frame)
+                .await
+                .map_err(|_| BedrockError::Interrupted {
+                    phase: FailurePhase::AwaitingResponse,
+                    kind: InterruptionKind::Timeout,
+                })??;
         let mut collector = StreamCollector::new(request.limits);
+        match first_event {
+            Some(event) => collector.absorb(event, observe)?,
+            None => return Err(ProtocolFailure::MissingTerminal.into()),
+        }
         loop {
             let phase = collector.phase();
             let event = tokio::time::timeout(request.limits.idle, response.stream.recv())

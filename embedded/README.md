@@ -84,11 +84,31 @@ existing durable document/run state, not a package-owned transcript database.
 Orderly Stop/failure recovery is fixture-tested. Process-death takeover of a run
 still marked active requires an explicit ownership design and is not provided here.
 
-The inherited native dependency-audit policy does not pass for this package:
-Claria's exact Tokio 1.52.3 pin has RUSTSEC-2026-0386, and AWS's SDK graph contains
-both generations of `http` and `http-body`. No audit exceptions were added. A
-coordinated dependency decision is required before this checkpoint can ship. An
-isolated probe of checkpoint `94acc810f6e96cb6f48ec10065fdab5f0c8a788d` passes the
-unchanged policy and all 23 checkpoint tests with Tokio 1.53.3, AWS config 1.12.0,
-Bedrock Runtime 1.146.0 and Smithy types 1.8.0. The integrated pins are unchanged;
-Claria's other exact AWS pins must move coherently before adopting that option.
+The Writer branches now adopt AWS config 1.8.18 → 1.12.0, Bedrock Runtime
+1.135.0 → 1.146.0, Smithy types 1.5.0 → 1.8.0 and Tokio 1.52.3 → 1.53.3
+(normal and dev), with Claria's other exact AWS pins moved coherently. The
+[September SDK migration](https://github.com/awslabs/aws-sdk-rust/blob/main/CHANGELOG.md#september-22nd-2026)
+removes HTTP 0.2/body 0.4 while preserving the modern transport. Tokio 1.53.3
+meets [RUSTSEC-2026-0386's fixed range](https://rustsec.org/advisories/RUSTSEC-2026-0386.html):
+`>=1.51.6, <1.52.0` or `>=1.53.3`. Claria also adopts h2 0.4.20, rustls 0.23.46,
+WebPKI 0.103.16 and ctutils 0.4.4, retaining AWS-LC and existing feature selections.
+
+The active embedded checkpoint has 35 passing tests, passing all-target Clippy
+and rustdoc with warnings denied, and a PASS in all four categories of the
+unchanged original dependency policy. The earlier disposable probe of
+`94acc810f6e96cb6f48ec10065fdab5f0c8a788d` passed 23 tests; that is separate historical
+evidence. The newer SDK returns after response headers, so one explicit deadline
+now covers send plus the first event. Loopback fixtures cover silent startup and
+cancellation; Claria additionally verifies immediate transient stream exceptions
+retry without losing usage uncertainty or duplicating document effects.
+
+Claria's broader eight-service run recorded 326 passed and 1 ignored. Its
+owner-approved strict selected-profile contract passed 12 subprocess scenarios
+plus the child test entrypoint, including actual loopback Bedrock signing and
+refusal of an ambient bearer-token bypass. These use the actual desktop config
+source in an isolated crate; GTK/WebKit desktop compilation and live SSO/role
+behavior remain unvalidated. The whole-Claria scan still reports 15 baseline
+advisory, unmaintained or yanked-package diagnostics. Claria's
+`design/writer-dependency-options.md` records the exact pins, primary advisory
+sources, receipts and remaining limits. No policy exceptions or changes to the
+concurrent extraction/error-sidecar release were made.
